@@ -11,28 +11,32 @@ so the logic lives in one place and per-repo specifics are passed as inputs.
 Starts a scoped documentation preview for a pull request in a repository
 registered by `ClickHouse/mintlify-docs-dev/remotes.json`. A maintainer invokes
 the caller manually from the remote repository's default branch. The shared
-workflow validates the open pull request, pins its exact head SHA, and uses the
-Workflow Authentication GitHub App to dispatch the central deployment workflow
-in `ClickHouse/mintlify-docs-dev`.
+workflow validates the open pull request, pins its exact head SHA, and directly
+creates a Vercel deployment of the current trusted Nimbus `main` revision in the
+`connect-preview` Custom Environment.
 
-The remote repository never receives Vercel credentials and the workflow never
-checks out or executes pull-request content. The central docs workflow builds
-trusted Nimbus code, fetches only the selected remote revision through Vercel
-Connect, and comments the resulting URL on the source pull request.
+The workflow never checks out or executes pull-request content and never passes
+a GitHub credential to Vercel. Inside the deployment, Vercel Connect exchanges
+the deployment's OIDC identity for a short-lived `contents:read` token scoped to
+the selected repository. Nimbus fetches the approved revision before it removes
+the token and begins processing Markdown or MDX. The shared workflow waits for
+the deployment and comments the resulting URL on the source pull request.
 
 | Input | Required | Purpose |
 |---|---|---|
 | `remote_name` | yes | Source name in the central `remotes.json` registry. |
 | `pull_request_number` | yes | Open pull request whose exact head SHA should be previewed. |
 
-Required secrets are `WORKFLOW_AUTH_PUBLIC_APP_ID` and
-`WORKFLOW_AUTH_PUBLIC_PRIVATE_KEY`. The GitHub App must be installed on both the
-source repository and `ClickHouse/mintlify-docs-dev`, with pull-request read
-access on the source and Actions write access on the docs repository.
+Required secrets are `VERCEL_TOKEN`, `VERCEL_ORG_ID`, and
+`VERCEL_PROJECT_ID`. Define them once as organization Actions secrets and grant
+them to the registered source repositories; callers can then pass the three
+secrets explicitly without duplicating their values per repository. The Vercel
+project must provide `DOCS_GITHUB_CONNECTOR` in its `connect-preview` Custom
+Environment and allow that environment to use the Vercel Connect GitHub app.
 
 See [`examples/caller-remote-docs-preview.yml`](examples/caller-remote-docs-preview.yml)
 for a copy-paste manual caller. Set `remote_name` to the source's registered
-name; no Vercel secret is needed in the remote repository.
+name.
 
 ### `claude-docs-drift.yml` - Dispatch centralized docs drift checks
 

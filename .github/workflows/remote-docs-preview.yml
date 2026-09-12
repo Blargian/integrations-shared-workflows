@@ -1,10 +1,9 @@
-name: Dispatch remote documentation preview
+name: Deploy remote documentation preview
 
-# A remote documentation repository calls this workflow manually after a
-# maintainer has reviewed the pull request. The workflow resolves and pins the
-# approved PR revision, then dispatches the credentialed build in the central
-# docs repository. It never checks out or executes pull-request content and it
-# never receives Vercel credentials.
+# A maintainer starts the caller manually from the source repository's default
+# branch. This workflow resolves the approved PR revision and creates a Vercel
+# deployment of trusted Nimbus main. The deployment—not Actions—uses Vercel
+# Connect to obtain a short-lived token for the selected remote repository.
 
 on:
   workflow_call:
@@ -18,33 +17,43 @@ on:
         required: true
         type: number
     secrets:
-      WORKFLOW_AUTH_PUBLIC_APP_ID:
+      VERCEL_TOKEN:
         required: true
-      WORKFLOW_AUTH_PUBLIC_PRIVATE_KEY:
+      VERCEL_ORG_ID:
         required: true
+      VERCEL_PROJECT_ID:
+        required: true
+    outputs:
+      preview_url:
+        description: URL of the completed Vercel preview
+        value: ${{ jobs.preview.outputs.preview_url }}
 
 permissions: {}
 
 jobs:
-  dispatch:
-    name: Request docs preview
+  preview:
+    name: Build docs preview on Vercel
     runs-on: ubuntu-latest
-    timeout-minutes: 5
+    timeout-minutes: 60
     permissions:
-      pull-requests: read
+      contents: read
+      pull-requests: write
     concurrency:
-      group: remote-docs-preview-dispatch-${{ github.repository }}-${{ inputs.pull_request_number }}
+      group: remote-docs-preview-${{ github.repository }}-${{ inputs.pull_request_number }}
       cancel-in-progress: true
+    outputs:
+      preview_url: ${{ steps.deploy.outputs.preview_url }}
     steps:
-      - name: Validate the request
+      - name: Resolve the approved revisions
         id: request
         env:
           DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+          DOCS_REPOSITORY: ClickHouse/mintlify-docs-dev
           EVENT_NAME: ${{ github.event_name }}
+          GH_TOKEN: ${{ github.token }}
           PULL_REQUEST_NUMBER: ${{ inputs.pull_request_number }}
           REMOTE_NAME: ${{ inputs.remote_name }}
           SOURCE_REPOSITORY: ${{ github.repository }}
-          GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
 
@@ -65,54 +74,307 @@ jobs:
             exit 1
           fi
 
-          pull_request="$(
-            gh api "repos/$SOURCE_REPOSITORY/pulls/$PULL_REQUEST_NUMBER"
-          )"
+          pull_request="$(gh api "repos/$SOURCE_REPOSITORY/pulls/$PULL_REQUEST_NUMBER")"
           if [[ "$(jq -r .state <<< "$pull_request")" != "open" ]]; then
             echo "::error::Pull request $SOURCE_REPOSITORY#$PULL_REQUEST_NUMBER is not open."
             exit 1
           fi
 
           head_sha="$(jq -er .head.sha <<< "$pull_request")"
+          head_repository="$(jq -er .head.repo.full_name <<< "$pull_request")"
+          site_sha="$(gh api "repos/$DOCS_REPOSITORY/commits/main" --jq .sha)"
           if [[ ! "$head_sha" =~ ^[0-9a-f]{40}$ ]]; then
             echo "::error::GitHub returned an invalid pull-request head SHA."
             exit 1
           fi
+          if [[ ! "$head_repository" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]]; then
+            echo "::error::GitHub returned an invalid pull-request head repository."
+            exit 1
+          fi
+          if [[ ! "$site_sha" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "::error::GitHub returned an invalid central docs SHA."
+            exit 1
+          fi
 
-          echo "head_sha=$head_sha" >> "$GITHUB_OUTPUT"
+          {
+            echo "head_sha=$head_sha"
+            echo "head_repository=$head_repository"
+            echo "site_sha=$site_sha"
+          } >> "$GITHUB_OUTPUT"
 
-      - name: Mint a docs-repository dispatch token
-        id: docs-token
-        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
-        with:
-          app-id: ${{ secrets.WORKFLOW_AUTH_PUBLIC_APP_ID }}
-          private-key: ${{ secrets.WORKFLOW_AUTH_PUBLIC_PRIVATE_KEY }}
-          owner: ClickHouse
-          repositories: mintlify-docs-dev
-          permission-actions: write
-          permission-contents: read
-
-      - name: Dispatch the central preview build
+      # The payload contains no GitHub credential. Vercel fetches the trusted
+      # Nimbus revision through the project's Git connection. During that
+      # build, @vercel/connect exchanges VERCEL_OIDC_TOKEN for a short-lived,
+      # contents:read token scoped to the selected source repository.
+      - name: Trigger and wait for the Vercel Connect preview
+        id: deploy
         env:
-          APPROVED_HEAD_SHA: ${{ steps.request.outputs.head_sha }}
-          DOCS_REPOSITORY: ClickHouse/mintlify-docs-dev
-          GH_TOKEN: ${{ steps.docs-token.outputs.token }}
+          DOCS_REMOTE_NAME: ${{ inputs.remote_name }}
+          DOCS_REMOTE_REF: ${{ steps.request.outputs.head_sha }}
+          DOCS_REMOTE_REPOSITORY: ${{ github.repository }}
+          DOCS_REMOTE_SOURCE_REPOSITORY: ${{ steps.request.outputs.head_repository }}
           PULL_REQUEST_NUMBER: ${{ inputs.pull_request_number }}
-          REMOTE_NAME: ${{ inputs.remote_name }}
-          SOURCE_REPOSITORY: ${{ github.repository }}
+          SITE_SHA: ${{ steps.request.outputs.site_sha }}
+          VERCEL_ORG_ID: ${{ secrets.VERCEL_ORG_ID }}
+          VERCEL_PROJECT_ID: ${{ secrets.VERCEL_PROJECT_ID }}
+          VERCEL_TOKEN: ${{ secrets.VERCEL_TOKEN }}
         run: |
           set -euo pipefail
 
-          gh workflow run remote-docs-preview.yml \
-            --repo "$DOCS_REPOSITORY" \
-            --ref main \
-            --field remote_name="$REMOTE_NAME" \
-            --field source_repository="$SOURCE_REPOSITORY" \
-            --field pull_request_number="$PULL_REQUEST_NUMBER" \
-            --field approved_head_sha="$APPROVED_HEAD_SHA"
+          deployment_id=""
+          deployment_finished=false
 
-          {
-            echo "### Documentation preview requested"
-            echo
-            echo "The central docs workflow will build \`$REMOTE_NAME\` from \`$SOURCE_REPOSITORY@$APPROVED_HEAD_SHA\` and add the preview URL to pull request #$PULL_REQUEST_NUMBER."
-          } >> "$GITHUB_STEP_SUMMARY"
+          cancel_vercel_deployment() {
+            local deployment_id_to_cancel="$1"
+            local deployment_label="$2"
+            local cancel_response
+            local cancel_exit_code
+            local deployment_response
+            local ready_state
+
+            if cancel_response="$(
+              curl --silent --show-error --fail-with-body \
+                --request PATCH \
+                --header "Authorization: Bearer $VERCEL_TOKEN" \
+                "https://api.vercel.com/v12/deployments/$deployment_id_to_cancel/cancel?teamId=$VERCEL_ORG_ID"
+            )"; then
+              echo "Canceled $deployment_label Vercel deployment $deployment_id_to_cancel."
+              return 0
+            else
+              cancel_exit_code=$?
+            fi
+
+            if deployment_response="$(
+              curl --silent --show-error --fail-with-body \
+                --header "Authorization: Bearer $VERCEL_TOKEN" \
+                "https://api.vercel.com/v13/deployments/$deployment_id_to_cancel?teamId=$VERCEL_ORG_ID"
+            )"; then
+              ready_state="$(jq -er .readyState <<< "$deployment_response")"
+              case "$ready_state" in
+                READY|ERROR|CANCELED|DELETED|BLOCKED)
+                  echo "$deployment_label Vercel deployment $deployment_id_to_cancel already reached $ready_state."
+                  return 0
+                  ;;
+              esac
+            fi
+
+            printf '%s\n' "$cancel_response" >&2
+            echo "Unable to cancel $deployment_label Vercel deployment $deployment_id_to_cancel." >&2
+            return "$cancel_exit_code"
+          }
+
+          cancel_superseded_deployments() {
+            local ready_state
+            local until=""
+            local list_response
+            local next
+            local superseded_id
+            local -a request_args
+            local -a deployment_ids
+
+            for ready_state in QUEUED INITIALIZING BUILDING; do
+              until=""
+              while true; do
+                request_args=(
+                  --silent
+                  --show-error
+                  --fail-with-body
+                  --get
+                  --header "Authorization: Bearer $VERCEL_TOKEN"
+                  --data-urlencode "projectId=$VERCEL_PROJECT_ID"
+                  --data-urlencode "state=$ready_state"
+                  --data-urlencode "limit=100"
+                  --data-urlencode "teamId=$VERCEL_ORG_ID"
+                )
+                if [[ -n "$until" ]]; then
+                  request_args+=(--data-urlencode "until=$until")
+                fi
+
+                if ! list_response="$(
+                  curl "${request_args[@]}" "https://api.vercel.com/v7/deployments"
+                )"; then
+                  printf '%s\n' "$list_response" >&2
+                  echo "Unable to list source-preview Vercel deployments." >&2
+                  return 1
+                fi
+
+                mapfile -t deployment_ids < <(
+                  jq -r \
+                    --arg pull_request "$PULL_REQUEST_NUMBER" \
+                    --arg source_repository "$DOCS_REMOTE_REPOSITORY" \
+                    '.deployments[]
+                      | select((.meta.buildScope? // "") == "source-preview")
+                      | select((.meta.sourceRepository? // "") == $source_repository)
+                      | select((.meta.pullRequest? // "") == $pull_request)
+                      | (.uid // .id)' \
+                    <<< "$list_response"
+                )
+                for superseded_id in "${deployment_ids[@]}"; do
+                  cancel_vercel_deployment "$superseded_id" "superseded source-preview" || return 1
+                done
+
+                next="$(jq -er '.pagination.next // ""' <<< "$list_response")"
+                if [[ -z "$next" ]]; then
+                  break
+                fi
+                if [[ "$next" == "$until" ]]; then
+                  echo "Vercel returned a repeated pagination cursor while listing source-preview deployments." >&2
+                  return 1
+                fi
+                until="$next"
+              done
+            done
+          }
+
+          finalize_deployment() {
+            local exit_code=$?
+            trap - EXIT INT TERM
+            if [[ "$deployment_finished" != true && -n "$deployment_id" ]]; then
+              if ! cancel_vercel_deployment "$deployment_id" "source-preview"; then
+                echo "::warning::Unable to cancel the interrupted source-preview deployment."
+                if [[ "$exit_code" -eq 0 ]]; then
+                  exit_code=1
+                fi
+              fi
+            fi
+            exit "$exit_code"
+          }
+
+          cancel_superseded_deployments
+
+          trap finalize_deployment EXIT
+          trap 'exit 130' INT
+          trap 'exit 143' TERM
+
+          if ! project_response="$(
+            curl --silent --show-error --fail-with-body \
+              --header "Authorization: Bearer $VERCEL_TOKEN" \
+              "https://api.vercel.com/v9/projects/$VERCEL_PROJECT_ID?teamId=$VERCEL_ORG_ID"
+          )"; then
+            printf '%s\n' "$project_response" >&2
+            exit 1
+          fi
+          project_name="$(jq -er .name <<< "$project_response")"
+
+          payload="$(
+            jq --null-input \
+              --arg approved_sha "$DOCS_REMOTE_REF" \
+              --arg project_id "$VERCEL_PROJECT_ID" \
+              --arg project_name "$project_name" \
+              --arg pull_request "$PULL_REQUEST_NUMBER" \
+              --arg remote_name "$DOCS_REMOTE_NAME" \
+              --arg remote_repository "$DOCS_REMOTE_REPOSITORY" \
+              --arg source_repository "$DOCS_REMOTE_SOURCE_REPOSITORY" \
+              --arg site_sha "$SITE_SHA" \
+              '{
+                name: $project_name,
+                project: $project_id,
+                customEnvironmentSlugOrId: "connect-preview",
+                gitSource: {
+                  type: "github",
+                  org: "ClickHouse",
+                  repo: "mintlify-docs-dev",
+                  ref: "main",
+                  sha: $site_sha
+                },
+                build: {env: {
+                  DOCS_DEPLOY_TARGET: "english",
+                  DOCS_LOCALES: "none",
+                  DOCS_AVAILABLE_LOCALES: "all",
+                  DOCS_REMOTES: "all",
+                  DOCS_REMOTE_NAME: $remote_name,
+                  DOCS_REMOTE_REPOSITORY: $remote_repository,
+                  DOCS_REMOTE_SOURCE_REPOSITORY: $source_repository,
+                  DOCS_REMOTE_REF: $approved_sha
+                }},
+                meta: {
+                  buildScope: "source-preview",
+                  sourceRepository: $remote_repository,
+                  sourceHeadRepository: $source_repository,
+                  pullRequest: $pull_request,
+                  approvedSha: $approved_sha,
+                  siteSha: $site_sha
+                }
+              }'
+          )"
+
+          if ! deployment_response="$(
+            curl --silent --show-error --fail-with-body \
+              --request POST \
+              --header "Authorization: Bearer $VERCEL_TOKEN" \
+              --header "Content-Type: application/json" \
+              --data "$payload" \
+              "https://api.vercel.com/v13/deployments?forceNew=1&teamId=$VERCEL_ORG_ID"
+          )"; then
+            printf '%s\n' "$deployment_response" >&2
+            exit 1
+          fi
+
+          deployment_id="$(jq -er .id <<< "$deployment_response")"
+          deployment_url="$(jq -er .url <<< "$deployment_response")"
+          preview_url="https://${deployment_url#https://}"
+          echo "preview_url=$preview_url" >> "$GITHUB_OUTPUT"
+          echo "Vercel deployment: $preview_url"
+
+          for _ in {1..360}; do
+            if ! deployment_response="$(
+              curl --silent --show-error --fail-with-body \
+                --header "Authorization: Bearer $VERCEL_TOKEN" \
+                "https://api.vercel.com/v13/deployments/$deployment_id?teamId=$VERCEL_ORG_ID"
+            )"; then
+              printf '%s\n' "$deployment_response" >&2
+              exit 1
+            fi
+
+            ready_state="$(jq -er .readyState <<< "$deployment_response")"
+            case "$ready_state" in
+              READY)
+                break
+                ;;
+              ERROR|CANCELED|DELETED|BLOCKED)
+                jq -r '(.errorCode // "deployment_failed") + ": " + (.errorMessage // "Vercel deployment did not complete")' \
+                  <<< "$deployment_response" >&2
+                exit 1
+                ;;
+              QUEUED|INITIALIZING|BUILDING)
+                sleep 10
+                ;;
+              *)
+                echo "Unexpected Vercel deployment state: $ready_state" >&2
+                exit 1
+                ;;
+            esac
+          done
+
+          if [[ "$ready_state" != "READY" ]]; then
+            echo "Timed out waiting for Vercel deployment $deployment_id." >&2
+            exit 1
+          fi
+          if [[ ! "$preview_url" =~ ^https://[^[:space:]]+$ ]]; then
+            echo "Vercel returned an invalid preview URL." >&2
+            exit 1
+          fi
+          deployment_finished=true
+
+      - name: Add the preview link to the pull request
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          PREVIEW_URL: ${{ steps.deploy.outputs.preview_url }}
+          PULL_REQUEST_NUMBER: ${{ inputs.pull_request_number }}
+        run: |
+          set -euo pipefail
+
+          marker="<!-- nimbus-remote-docs-preview -->"
+          docs_url="${PREVIEW_URL%/}/docs"
+          body="$(printf '%s\n\nDocumentation preview: %s' "$marker" "$docs_url")"
+          comment_id="$(
+            gh api --paginate "repos/$GH_REPO/issues/$PULL_REQUEST_NUMBER/comments" \
+              --jq ".[] | select(.user.login == \"github-actions[bot]\") | select(.body | contains(\"$marker\")) | .id" \
+              | tail -n 1
+          )"
+          if [[ -n "$comment_id" ]]; then
+            gh api --method PATCH "repos/$GH_REPO/issues/comments/$comment_id" -f body="$body" >/dev/null
+          else
+            gh pr comment "$PULL_REQUEST_NUMBER" --body "$body"
+          fi
