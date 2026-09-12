@@ -10,8 +10,9 @@ so the logic lives in one place and per-repo specifics are passed as inputs.
 
 Starts a scoped documentation preview for a pull request in a repository
 registered by `ClickHouse/mintlify-docs-dev/remotes.json`. A maintainer invokes
-the caller manually from the remote repository's default branch. The shared
-workflow validates the open pull request, pins its exact head SHA, and directly
+the caller by adding the `docs-preview` label to a pull request targeting the
+remote repository's default branch. The shared workflow validates the trusted
+label event, pins the pull request's exact head SHA, and directly
 creates a Vercel deployment of the current trusted Nimbus `main` revision in the
 `connect-preview` Custom Environment.
 
@@ -35,8 +36,10 @@ project must provide `DOCS_GITHUB_CONNECTOR` in its `connect-preview` Custom
 Environment and allow that environment to use the Vercel Connect GitHub app.
 
 See [`examples/caller-remote-docs-preview.yml`](examples/caller-remote-docs-preview.yml)
-for a copy-paste manual caller. Set `remote_name` to the source's registered
-name.
+for a copy-paste `pull_request_target` caller. Set `remote_name` to the source's
+registered name. The caller deliberately listens only for `labeled` events and
+the shared workflow independently verifies the `docs-preview` label, action,
+pull request number, and default target branch.
 
 ### `claude-docs-drift.yml` - Dispatch centralized docs drift checks
 

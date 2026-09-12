@@ -1,9 +1,10 @@
 name: Deploy remote documentation preview
 
-# A maintainer starts the caller manually from the source repository's default
-# branch. This workflow resolves the approved PR revision and creates a Vercel
-# deployment of trusted Nimbus main. The deployment—not Actions—uses Vercel
-# Connect to obtain a short-lived token for the selected remote repository.
+# A maintainer approves a source pull request by adding the `docs-preview`
+# label. The trusted pull_request_target caller invokes this workflow, which
+# resolves the approved PR revision and creates a Vercel deployment of trusted
+# Nimbus main. The deployment—not Actions—uses Vercel Connect to obtain a
+# short-lived token for the selected remote repository.
 
 on:
   workflow_call:
@@ -48,8 +49,12 @@ jobs:
         id: request
         env:
           DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+          EVENT_ACTION: ${{ github.event.action }}
+          EVENT_BASE_REF: ${{ github.event.pull_request.base.ref }}
+          EVENT_LABEL: ${{ github.event.label.name }}
           DOCS_REPOSITORY: ClickHouse/mintlify-docs-dev
           EVENT_NAME: ${{ github.event_name }}
+          EVENT_PULL_REQUEST_NUMBER: ${{ github.event.pull_request.number }}
           GH_TOKEN: ${{ github.token }}
           PULL_REQUEST_NUMBER: ${{ inputs.pull_request_number }}
           REMOTE_NAME: ${{ inputs.remote_name }}
@@ -57,12 +62,12 @@ jobs:
         run: |
           set -euo pipefail
 
-          if [[ "$EVENT_NAME" != "workflow_dispatch" ]]; then
-            echo "::error::Remote documentation previews must be requested through a manual workflow_dispatch event."
+          if [[ "$EVENT_NAME" != "pull_request_target" || "$EVENT_ACTION" != "labeled" || "$EVENT_LABEL" != "docs-preview" ]]; then
+            echo "::error::Remote documentation previews require a pull_request_target labeled event for docs-preview."
             exit 1
           fi
-          if [[ "$GITHUB_REF_NAME" != "$DEFAULT_BRANCH" ]]; then
-            echo "::error::Run the caller workflow from the repository's default branch."
+          if [[ "$EVENT_BASE_REF" != "$DEFAULT_BRANCH" ]]; then
+            echo "::error::The pull request must target the repository's default branch."
             exit 1
           fi
           if [[ ! "$REMOTE_NAME" =~ ^[a-z0-9][a-z0-9-]*$ ]]; then
@@ -71,6 +76,10 @@ jobs:
           fi
           if [[ ! "$PULL_REQUEST_NUMBER" =~ ^[1-9][0-9]*$ ]]; then
             echo "::error::pull_request_number must be a positive integer."
+            exit 1
+          fi
+          if [[ "$PULL_REQUEST_NUMBER" != "$EVENT_PULL_REQUEST_NUMBER" ]]; then
+            echo "::error::pull_request_number must match the labeled pull request."
             exit 1
           fi
 
