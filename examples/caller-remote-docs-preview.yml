@@ -12,6 +12,10 @@ run-name: Preview documentation for PR #${{ github.event.pull_request.number }}
 on:
   pull_request_target:
     types: [labeled]
+    # Configure this for the directory exported by this repository. Remove the
+    # paths filter if every pull request should be eligible for a docs preview.
+    paths:
+      - "docs/**"
 
 permissions:
   contents: read
@@ -19,6 +23,8 @@ permissions:
 
 jobs:
   preview:
+    # Both conditions must hold: the PR changes the configured paths above and
+    # a maintainer has explicitly approved this SHA for preview.
     if: github.event.label.name == 'docs-preview'
     uses: ClickHouse/integrations-shared-workflows/.github/workflows/remote-docs-preview.yml@main
     with:

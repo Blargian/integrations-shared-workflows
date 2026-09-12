@@ -37,9 +37,13 @@ Environment and allow that environment to use the Vercel Connect GitHub app.
 
 See [`examples/caller-remote-docs-preview.yml`](examples/caller-remote-docs-preview.yml)
 for a copy-paste `pull_request_target` caller. Set `remote_name` to the source's
-registered name. The caller deliberately listens only for `labeled` events and
-the shared workflow independently verifies the `docs-preview` label, action,
-pull request number, and default target branch.
+registered name and configure the caller's native `paths` filter for the files
+that should be eligible, such as `docs/**`. Remove `paths` when every pull
+request should be eligible. GitHub starts the reusable workflow only when the
+pull request changes a configured path and a maintainer adds `docs-preview`.
+The caller deliberately listens only for `labeled` events and the shared
+workflow independently verifies the label, action, pull request number, and
+default target branch.
 
 ### `claude-docs-drift.yml` - Dispatch centralized docs drift checks
 
