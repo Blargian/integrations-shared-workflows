@@ -1,0 +1,32 @@
+# Install as .github/workflows/docs-preview.yml in a repository registered as a
+# remote documentation source in ClickHouse/mintlify-docs-dev/remotes.json.
+#
+# A maintainer starts the workflow manually from the repository's default
+# branch and supplies the open pull request number. Pull-request code is not
+# checked out or executed in Actions. The central docs repository performs the
+# Vercel build and comments its URL on the source pull request.
+name: Preview documentation
+
+run-name: Preview documentation for PR #${{ inputs.pull_request_number }}
+
+on:
+  workflow_dispatch:
+    inputs:
+      pull_request_number:
+        description: Pull request number to preview
+        required: true
+        type: number
+
+permissions:
+  pull-requests: read
+
+jobs:
+  preview:
+    uses: ClickHouse/integrations-shared-workflows/.github/workflows/remote-docs-preview.yml@main
+    with:
+      # This must match the source's name in the central remotes.json registry.
+      remote_name: clickhouse-private
+      pull_request_number: ${{ inputs.pull_request_number }}
+    secrets:
+      WORKFLOW_AUTH_PUBLIC_APP_ID: ${{ secrets.WORKFLOW_AUTH_PUBLIC_APP_ID }}
+      WORKFLOW_AUTH_PUBLIC_PRIVATE_KEY: ${{ secrets.WORKFLOW_AUTH_PUBLIC_PRIVATE_KEY }}

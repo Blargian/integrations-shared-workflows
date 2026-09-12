@@ -6,6 +6,34 @@ so the logic lives in one place and per-repo specifics are passed as inputs.
 
 ## Workflows
 
+### `remote-docs-preview.yml` - Request a remote documentation preview
+
+Starts a scoped documentation preview for a pull request in a repository
+registered by `ClickHouse/mintlify-docs-dev/remotes.json`. A maintainer invokes
+the caller manually from the remote repository's default branch. The shared
+workflow validates the open pull request, pins its exact head SHA, and uses the
+Workflow Authentication GitHub App to dispatch the central deployment workflow
+in `ClickHouse/mintlify-docs-dev`.
+
+The remote repository never receives Vercel credentials and the workflow never
+checks out or executes pull-request content. The central docs workflow builds
+trusted Nimbus code, fetches only the selected remote revision through Vercel
+Connect, and comments the resulting URL on the source pull request.
+
+| Input | Required | Purpose |
+|---|---|---|
+| `remote_name` | yes | Source name in the central `remotes.json` registry. |
+| `pull_request_number` | yes | Open pull request whose exact head SHA should be previewed. |
+
+Required secrets are `WORKFLOW_AUTH_PUBLIC_APP_ID` and
+`WORKFLOW_AUTH_PUBLIC_PRIVATE_KEY`. The GitHub App must be installed on both the
+source repository and `ClickHouse/mintlify-docs-dev`, with pull-request read
+access on the source and Actions write access on the docs repository.
+
+See [`examples/caller-remote-docs-preview.yml`](examples/caller-remote-docs-preview.yml)
+for a copy-paste manual caller. Set `remote_name` to the source's registered
+name; no Vercel secret is needed in the remote repository.
+
 ### `claude-docs-drift.yml` - Dispatch centralized docs drift checks
 
 Sends a source pull request to the central docs-drift worker in

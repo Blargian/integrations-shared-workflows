@@ -22,3 +22,4 @@ rules:
       # you add an example caller.
       - caller-claude-pr-triage.yml
       - caller-claude-docs-drift.yml
+      - caller-remote-docs-preview.yml

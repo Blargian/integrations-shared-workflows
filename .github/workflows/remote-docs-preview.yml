@@ -1,0 +1,118 @@
+name: Dispatch remote documentation preview
+
+# A remote documentation repository calls this workflow manually after a
+# maintainer has reviewed the pull request. The workflow resolves and pins the
+# approved PR revision, then dispatches the credentialed build in the central
+# docs repository. It never checks out or executes pull-request content and it
+# never receives Vercel credentials.
+
+on:
+  workflow_call:
+    inputs:
+      remote_name:
+        description: Source name registered in the central docs remotes.json
+        required: true
+        type: string
+      pull_request_number:
+        description: Open pull request to preview
+        required: true
+        type: number
+    secrets:
+      WORKFLOW_AUTH_PUBLIC_APP_ID:
+        required: true
+      WORKFLOW_AUTH_PUBLIC_PRIVATE_KEY:
+        required: true
+
+permissions: {}
+
+jobs:
+  dispatch:
+    name: Request docs preview
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      pull-requests: read
+    concurrency:
+      group: remote-docs-preview-dispatch-${{ github.repository }}-${{ inputs.pull_request_number }}
+      cancel-in-progress: true
+    steps:
+      - name: Validate the request
+        id: request
+        env:
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+          EVENT_NAME: ${{ github.event_name }}
+          PULL_REQUEST_NUMBER: ${{ inputs.pull_request_number }}
+          REMOTE_NAME: ${{ inputs.remote_name }}
+          SOURCE_REPOSITORY: ${{ github.repository }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+
+          if [[ "$EVENT_NAME" != "workflow_dispatch" ]]; then
+            echo "::error::Remote documentation previews must be requested through a manual workflow_dispatch event."
+            exit 1
+          fi
+          if [[ "$GITHUB_REF_NAME" != "$DEFAULT_BRANCH" ]]; then
+            echo "::error::Run the caller workflow from the repository's default branch."
+            exit 1
+          fi
+          if [[ ! "$REMOTE_NAME" =~ ^[a-z0-9][a-z0-9-]*$ ]]; then
+            echo "::error::remote_name must contain only lowercase letters, numbers, and hyphens."
+            exit 1
+          fi
+          if [[ ! "$PULL_REQUEST_NUMBER" =~ ^[1-9][0-9]*$ ]]; then
+            echo "::error::pull_request_number must be a positive integer."
+            exit 1
+          fi
+
+          pull_request="$(
+            gh api "repos/$SOURCE_REPOSITORY/pulls/$PULL_REQUEST_NUMBER"
+          )"
+          if [[ "$(jq -r .state <<< "$pull_request")" != "open" ]]; then
+            echo "::error::Pull request $SOURCE_REPOSITORY#$PULL_REQUEST_NUMBER is not open."
+            exit 1
+          fi
+
+          head_sha="$(jq -er .head.sha <<< "$pull_request")"
+          if [[ ! "$head_sha" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "::error::GitHub returned an invalid pull-request head SHA."
+            exit 1
+          fi
+
+          echo "head_sha=$head_sha" >> "$GITHUB_OUTPUT"
+
+      - name: Mint a docs-repository dispatch token
+        id: docs-token
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        with:
+          app-id: ${{ secrets.WORKFLOW_AUTH_PUBLIC_APP_ID }}
+          private-key: ${{ secrets.WORKFLOW_AUTH_PUBLIC_PRIVATE_KEY }}
+          owner: ClickHouse
+          repositories: mintlify-docs-dev
+          permission-actions: write
+          permission-contents: read
+
+      - name: Dispatch the central preview build
+        env:
+          APPROVED_HEAD_SHA: ${{ steps.request.outputs.head_sha }}
+          DOCS_REPOSITORY: ClickHouse/mintlify-docs-dev
+          GH_TOKEN: ${{ steps.docs-token.outputs.token }}
+          PULL_REQUEST_NUMBER: ${{ inputs.pull_request_number }}
+          REMOTE_NAME: ${{ inputs.remote_name }}
+          SOURCE_REPOSITORY: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+
+          gh workflow run remote-docs-preview.yml \
+            --repo "$DOCS_REPOSITORY" \
+            --ref main \
+            --field remote_name="$REMOTE_NAME" \
+            --field source_repository="$SOURCE_REPOSITORY" \
+            --field pull_request_number="$PULL_REQUEST_NUMBER" \
+            --field approved_head_sha="$APPROVED_HEAD_SHA"
+
+          {
+            echo "### Documentation preview requested"
+            echo
+            echo "The central docs workflow will build \`$REMOTE_NAME\` from \`$SOURCE_REPOSITORY@$APPROVED_HEAD_SHA\` and add the preview URL to pull request #$PULL_REQUEST_NUMBER."
+          } >> "$GITHUB_STEP_SUMMARY"
