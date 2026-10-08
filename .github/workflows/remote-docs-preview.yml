@@ -162,9 +162,10 @@ jobs:
 
           deployment_id=""
           deployment_finished=false
-          # Leave enough of the 60-minute job budget to cancel a timed-out
-          # deployment and report a useful error rather than being hard-killed.
-          poll_deadline=$((SECONDS + 3000))
+          # Vercel caps this environment's builds at 40 minutes. Stop polling
+          # at that limit while preserving job time for cancellation and a
+          # useful failure report.
+          poll_deadline=$((SECONDS + 2400))
 
           cancel_vercel_deployment() {
             local deployment_id_to_cancel="$1"
@@ -211,6 +212,7 @@ jobs:
             local list_response
             local next
             local superseded_id
+            local deployment_ids_json
             local -a request_args
             local -a deployment_ids
 
@@ -240,19 +242,29 @@ jobs:
                   return 1
                 fi
 
-                mapfile -t deployment_ids < <(
-                  jq -r \
+                if ! deployment_ids_json="$(
+                  jq -ce \
                     --arg pull_request "$PULL_REQUEST_NUMBER" \
                     --arg source_repository "$DOCS_REMOTE_REPOSITORY" \
-                    '.deployments[]
+                    '[.deployments[]
                       | select((.meta.buildScope? // "") == "source-preview")
                       | select((.meta.sourceRepository? // "") == $source_repository)
                       | select((.meta.pullRequest? // "") == $pull_request)
-                      | (.uid // .id)' \
+                      | (.uid // .id)]' \
                     <<< "$list_response"
-                )
+                )"; then
+                  echo "Vercel returned an invalid deployment list." >&2
+                  return 1
+                fi
+
+                deployment_ids=()
+                if [[ "$deployment_ids_json" != "[]" ]]; then
+                  mapfile -t deployment_ids < <(jq -r '.[]' <<< "$deployment_ids_json")
+                fi
                 for superseded_id in "${deployment_ids[@]}"; do
-                  cancel_vercel_deployment "$superseded_id" "superseded source-preview" || return 1
+                  if ! cancel_vercel_deployment "$superseded_id" "superseded source-preview"; then
+                    echo "::warning::Unable to cancel superseded source-preview deployment $superseded_id; continuing with the new preview."
+                  fi
                 done
 
                 next="$(jq -er '.pagination.next // ""' <<< "$list_response")"
@@ -360,6 +372,10 @@ jobs:
           deployment_id="$(jq -er .id <<< "$deployment_response")"
           deployment_url="$(jq -er .url <<< "$deployment_response")"
           preview_url="https://${deployment_url#https://}"
+          if [[ ! "$preview_url" =~ ^https://[^[:space:]]+$ ]]; then
+            echo "Vercel returned an invalid preview URL." >&2
+            exit 1
+          fi
           echo "preview_url=$preview_url" >> "$GITHUB_OUTPUT"
           echo "Vercel deployment: $preview_url"
 
@@ -404,10 +420,6 @@ jobs:
 
           if [[ "$ready_state" != "READY" ]]; then
             echo "Timed out waiting for Vercel deployment $deployment_id." >&2
-            exit 1
-          fi
-          if [[ ! "$preview_url" =~ ^https://[^[:space:]]+$ ]]; then
-            echo "Vercel returned an invalid preview URL." >&2
             exit 1
           fi
           deployment_finished=true
