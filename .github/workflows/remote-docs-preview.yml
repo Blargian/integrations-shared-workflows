@@ -1,10 +1,10 @@
 name: Deploy remote documentation preview
 
-# A maintainer approves a source pull request by adding the `docs-preview`
-# label. The trusted pull_request_target caller invokes this workflow, which
-# resolves the approved PR revision and creates a Vercel deployment of trusted
-# Nimbus main. The deployment—not Actions—uses Vercel Connect to obtain a
-# short-lived token for the selected remote repository.
+# A maintainer authorizes previews for a source pull request by adding the
+# `docs-preview` label. The trusted pull_request_target caller invokes this
+# workflow for that event and later commits while the label remains. It deploys
+# trusted Nimbus main; the deployment—not Actions—uses Vercel Connect to obtain
+# a short-lived token for the registered source repository.
 
 on:
   workflow_call:
@@ -51,6 +51,9 @@ jobs:
           DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
           EVENT_ACTION: ${{ github.event.action }}
           EVENT_BASE_REF: ${{ github.event.pull_request.base.ref }}
+          EVENT_HAS_DOCS_PREVIEW_LABEL: ${{ contains(github.event.pull_request.labels.*.name, 'docs-preview') }}
+          EVENT_HEAD_REPOSITORY: ${{ github.event.pull_request.head.repo.full_name }}
+          EVENT_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
           EVENT_LABEL: ${{ github.event.label.name }}
           DOCS_REPOSITORY: ClickHouse/mintlify-docs-dev
           EVENT_NAME: ${{ github.event_name }}
@@ -62,10 +65,28 @@ jobs:
         run: |
           set -euo pipefail
 
-          if [[ "$EVENT_NAME" != "pull_request_target" || "$EVENT_ACTION" != "labeled" || "$EVENT_LABEL" != "docs-preview" ]]; then
-            echo "::error::Remote documentation previews require a pull_request_target labeled event for docs-preview."
+          if [[ "$EVENT_NAME" != "pull_request_target" ]]; then
+            echo "::error::Remote documentation previews require a pull_request_target event."
             exit 1
           fi
+          case "$EVENT_ACTION" in
+            labeled)
+              if [[ "$EVENT_LABEL" != "docs-preview" || "$EVENT_HAS_DOCS_PREVIEW_LABEL" != "true" ]]; then
+                echo "::error::A labeled event must add the docs-preview label."
+                exit 1
+              fi
+              ;;
+            synchronize)
+              if [[ "$EVENT_HAS_DOCS_PREVIEW_LABEL" != "true" ]]; then
+                echo "::error::A synchronize event requires the docs-preview label."
+                exit 1
+              fi
+              ;;
+            *)
+              echo "::error::Remote documentation previews require a docs-preview labeled or synchronize event."
+              exit 1
+              ;;
+          esac
           if [[ "$EVENT_BASE_REF" != "$DEFAULT_BRANCH" ]]; then
             echo "::error::The pull request must target the repository's default branch."
             exit 1
@@ -89,25 +110,33 @@ jobs:
             exit 1
           fi
 
-          head_sha="$(jq -er .head.sha <<< "$pull_request")"
-          head_repository="$(jq -er .head.repo.full_name <<< "$pull_request")"
+          live_head_sha="$(jq -er .head.sha <<< "$pull_request")"
+          live_head_repository="$(jq -er .head.repo.full_name <<< "$pull_request")"
           site_sha="$(gh api "repos/$DOCS_REPOSITORY/commits/main" --jq .sha)"
-          if [[ ! "$head_sha" =~ ^[0-9a-f]{40}$ ]]; then
-            echo "::error::GitHub returned an invalid pull-request head SHA."
+          if [[ ! "$EVENT_HEAD_SHA" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "::error::The event payload contains an invalid pull-request head SHA."
             exit 1
           fi
-          if [[ ! "$head_repository" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]]; then
-            echo "::error::GitHub returned an invalid pull-request head repository."
+          if [[ ! "$EVENT_HEAD_REPOSITORY" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]]; then
+            echo "::error::The event payload contains an invalid pull-request head repository."
             exit 1
           fi
           if [[ ! "$site_sha" =~ ^[0-9a-f]{40}$ ]]; then
             echo "::error::GitHub returned an invalid central docs SHA."
             exit 1
           fi
+          if [[ "$live_head_sha" != "$EVENT_HEAD_SHA" || "$live_head_repository" != "$EVENT_HEAD_REPOSITORY" ]]; then
+            echo "::error::The pull request head changed after this event; wait for the next event before creating a preview."
+            exit 1
+          fi
+          if ! jq -e --arg label "docs-preview" 'any(.labels[]; .name == $label)' <<< "$pull_request" >/dev/null; then
+            echo "::error::The docs-preview label was removed before this preview could start."
+            exit 1
+          fi
 
           {
-            echo "head_sha=$head_sha"
-            echo "head_repository=$head_repository"
+            echo "head_sha=$EVENT_HEAD_SHA"
+            echo "head_repository=$EVENT_HEAD_REPOSITORY"
             echo "site_sha=$site_sha"
           } >> "$GITHUB_OUTPUT"
 
@@ -122,6 +151,7 @@ jobs:
           DOCS_REMOTE_REF: ${{ steps.request.outputs.head_sha }}
           DOCS_REMOTE_REPOSITORY: ${{ github.repository }}
           DOCS_REMOTE_SOURCE_REPOSITORY: ${{ steps.request.outputs.head_repository }}
+          DOCS_REMOTE_PULL_REQUEST_REF: refs/pull/${{ inputs.pull_request_number }}/head
           PULL_REQUEST_NUMBER: ${{ inputs.pull_request_number }}
           SITE_SHA: ${{ steps.request.outputs.site_sha }}
           VERCEL_ORG_ID: ${{ secrets.VERCEL_ORG_ID }}
@@ -132,6 +162,9 @@ jobs:
 
           deployment_id=""
           deployment_finished=false
+          # Leave enough of the 60-minute job budget to cancel a timed-out
+          # deployment and report a useful error rather than being hard-killed.
+          poll_deadline=$((SECONDS + 3000))
 
           cancel_vercel_deployment() {
             local deployment_id_to_cancel="$1"
@@ -237,7 +270,10 @@ jobs:
 
           finalize_deployment() {
             local exit_code=$?
-            trap - EXIT INT TERM
+            trap - EXIT
+            # GitHub sends TERM shortly after INT. Keep the cleanup request
+            # alive long enough to cancel the Vercel deployment.
+            trap '' INT TERM
             if [[ "$deployment_finished" != true && -n "$deployment_id" ]]; then
               if ! cancel_vercel_deployment "$deployment_id" "source-preview"; then
                 echo "::warning::Unable to cancel the interrupted source-preview deployment."
@@ -274,6 +310,7 @@ jobs:
               --arg remote_name "$DOCS_REMOTE_NAME" \
               --arg remote_repository "$DOCS_REMOTE_REPOSITORY" \
               --arg source_repository "$DOCS_REMOTE_SOURCE_REPOSITORY" \
+              --arg pull_request_ref "$DOCS_REMOTE_PULL_REQUEST_REF" \
               --arg site_sha "$SITE_SHA" \
               '{
                 name: $project_name,
@@ -294,6 +331,7 @@ jobs:
                   DOCS_REMOTE_NAME: $remote_name,
                   DOCS_REMOTE_REPOSITORY: $remote_repository,
                   DOCS_REMOTE_SOURCE_REPOSITORY: $source_repository,
+                  DOCS_REMOTE_PULL_REQUEST_REF: $pull_request_ref,
                   DOCS_REMOTE_REF: $approved_sha
                 }},
                 meta: {
@@ -325,7 +363,7 @@ jobs:
           echo "preview_url=$preview_url" >> "$GITHUB_OUTPUT"
           echo "Vercel deployment: $preview_url"
 
-          for _ in {1..360}; do
+          while (( SECONDS < poll_deadline )); do
             if ! deployment_response="$(
               curl --silent --show-error --fail-with-body \
                 --header "Authorization: Bearer $VERCEL_TOKEN" \
@@ -346,7 +384,16 @@ jobs:
                 exit 1
                 ;;
               QUEUED|INITIALIZING|BUILDING)
-                sleep 10
+                remaining_seconds=$((poll_deadline - SECONDS))
+                if (( remaining_seconds <= 0 )); then
+                  break
+                fi
+                sleep_seconds=10
+                if (( remaining_seconds < sleep_seconds )); then
+                  sleep_seconds=$remaining_seconds
+                fi
+                sleep "$sleep_seconds" &
+                wait "$!"
                 ;;
               *)
                 echo "Unexpected Vercel deployment state: $ready_state" >&2

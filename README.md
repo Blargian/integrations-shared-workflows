@@ -9,19 +9,21 @@ so the logic lives in one place and per-repo specifics are passed as inputs.
 ### `remote-docs-preview.yml` - Request a remote documentation preview
 
 Starts a scoped documentation preview for a pull request in a repository
-registered by `ClickHouse/mintlify-docs-dev/remotes.json`. A maintainer invokes
-the caller by adding the `docs-preview` label to a pull request targeting the
-remote repository's default branch. The shared workflow validates the trusted
-label event, pins the pull request's exact head SHA, and directly
+registered by `ClickHouse/mintlify-docs-dev/remotes.json`. A maintainer enables
+previews by adding the `docs-preview` label to a pull request targeting the
+remote repository's default branch. The label remains effective until removed,
+so later commits refresh the preview. Each run validates its trusted event and
+pins that event's exact head SHA, then directly
 creates a Vercel deployment of the current trusted Nimbus `main` revision in the
 `connect-preview` Custom Environment.
 
 The workflow never checks out or executes pull-request content and never passes
 a GitHub credential to Vercel. Inside the deployment, Vercel Connect exchanges
 the deployment's OIDC identity for a short-lived `contents:read` token scoped to
-the selected repository. Nimbus fetches the approved revision before it removes
-the token and begins processing Markdown or MDX. The shared workflow waits for
-the deployment and comments the resulting URL on the source pull request.
+the registered source repository. Nimbus fetches its `refs/pull/<number>/head`
+ref, verifies that it resolves to the event SHA, then removes the token before
+it begins processing Markdown or MDX. The shared workflow waits for the
+deployment and comments the resulting URL on the source pull request.
 
 | Input | Required | Purpose |
 |---|---|---|
@@ -39,11 +41,11 @@ See [`examples/caller-remote-docs-preview.yml`](examples/caller-remote-docs-prev
 for a copy-paste `pull_request_target` caller. Set `remote_name` to the source's
 registered name and configure the caller's native `paths` filter for the files
 that should be eligible, such as `docs/**`. Remove `paths` when every pull
-request should be eligible. GitHub starts the reusable workflow only when the
-pull request changes a configured path and a maintainer adds `docs-preview`.
-The caller deliberately listens only for `labeled` events and the shared
-workflow independently verifies the label, action, pull request number, and
-default target branch.
+request should be eligible. GitHub starts the reusable workflow when the pull
+request changes a configured path, a maintainer adds `docs-preview`, or the
+labelled pull request receives a new commit. The caller listens only for
+`labeled` and `synchronize` events; the shared workflow independently verifies
+the label, action, pull request number, event SHA, and default target branch.
 
 ### `claude-docs-drift.yml` - Dispatch centralized docs drift checks
 

@@ -1,17 +1,18 @@
 # Install as .github/workflows/docs-preview.yml in a repository registered as a
 # remote documentation source in ClickHouse/mintlify-docs-dev/remotes.json.
 #
-# A maintainer approves a pull request by adding the `docs-preview` label. This
+# A maintainer enables previews for a pull request by adding the `docs-preview`
+# label. While the label remains, each new commit refreshes the preview. This
 # uses pull_request_target so organization secrets are available for fork PRs,
 # but neither this caller nor the shared workflow checks out or executes PR
-# code. Vercel Connect fetches the approved remote revision inside the build.
+# code. Vercel Connect fetches the base repository's PR ref inside the build.
 name: Preview documentation
 
 run-name: Preview documentation for PR #${{ github.event.pull_request.number }}
 
 on:
   pull_request_target:
-    types: [labeled]
+    types: [labeled, synchronize]
     # Configure this for the directory exported by this repository. Remove the
     # paths filter if every pull request should be eligible for a docs preview.
     paths:
@@ -24,8 +25,8 @@ permissions:
 jobs:
   preview:
     # Both conditions must hold: the PR changes the configured paths above and
-    # a maintainer has explicitly approved this SHA for preview.
-    if: github.event.label.name == 'docs-preview'
+    # a maintainer has enabled previews by applying docs-preview.
+    if: contains(github.event.pull_request.labels.*.name, 'docs-preview')
     uses: ClickHouse/integrations-shared-workflows/.github/workflows/remote-docs-preview.yml@main
     with:
       # This must match the source's name in the central remotes.json registry.
