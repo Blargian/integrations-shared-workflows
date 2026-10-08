@@ -1,10 +1,7 @@
 name: Deploy remote documentation preview
 
-# A maintainer authorizes previews for a source pull request by adding the
-# `docs-preview` label. The trusted pull_request_target caller invokes this
-# workflow for that event and later commits while the label remains. It deploys
-# trusted Nimbus main; the deployment—not Actions—uses Vercel Connect to obtain
-# a short-lived token for the registered source repository.
+# The authorization and Vercel Connect security model are documented in the
+# remote-docs-preview section of README.md.
 
 on:
   workflow_call:
@@ -36,8 +33,10 @@ jobs:
     name: Build docs preview on Vercel
     runs-on: ubuntu-latest
     timeout-minutes: 60
+    env:
+      DOCS_REPOSITORY: ClickHouse/mintlify-docs-dev
+      DOCS_REF: main
     permissions:
-      contents: read
       pull-requests: write
     concurrency:
       group: remote-docs-preview-${{ github.repository }}-${{ inputs.pull_request_number }}
@@ -55,7 +54,6 @@ jobs:
           EVENT_HEAD_REPOSITORY: ${{ github.event.pull_request.head.repo.full_name }}
           EVENT_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
           EVENT_LABEL: ${{ github.event.label.name }}
-          DOCS_REPOSITORY: ClickHouse/mintlify-docs-dev
           EVENT_NAME: ${{ github.event_name }}
           EVENT_PULL_REQUEST_NUMBER: ${{ github.event.pull_request.number }}
           GH_TOKEN: ${{ github.token }}
@@ -112,7 +110,7 @@ jobs:
 
           live_head_sha="$(jq -er .head.sha <<< "$pull_request")"
           live_head_repository="$(jq -er .head.repo.full_name <<< "$pull_request")"
-          site_sha="$(gh api "repos/$DOCS_REPOSITORY/commits/main" --jq .sha)"
+          site_sha="$(gh api "repos/$DOCS_REPOSITORY/commits/$DOCS_REF" --jq .sha)"
           if [[ ! "$EVENT_HEAD_SHA" =~ ^[0-9a-f]{40}$ ]]; then
             echo "::error::The event payload contains an invalid pull-request head SHA."
             exit 1
@@ -140,10 +138,7 @@ jobs:
             echo "site_sha=$site_sha"
           } >> "$GITHUB_OUTPUT"
 
-      # The payload contains no GitHub credential. Vercel fetches the trusted
-      # Nimbus revision through the project's Git connection. During that
-      # build, @vercel/connect exchanges VERCEL_OIDC_TOKEN for a short-lived,
-      # contents:read token scoped to the selected source repository.
+      # The deployment security model is documented in README.md.
       - name: Trigger and wait for the Vercel Connect preview
         id: deploy
         env:
@@ -312,6 +307,12 @@ jobs:
             exit 1
           fi
           project_name="$(jq -er .name <<< "$project_response")"
+          docs_owner="${DOCS_REPOSITORY%%/*}"
+          docs_repo="${DOCS_REPOSITORY##*/}"
+          if [[ ! "$DOCS_REPOSITORY" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]]; then
+            echo "Invalid central docs repository: $DOCS_REPOSITORY" >&2
+            exit 1
+          fi
 
           payload="$(
             jq --null-input \
@@ -324,15 +325,18 @@ jobs:
               --arg source_repository "$DOCS_REMOTE_SOURCE_REPOSITORY" \
               --arg pull_request_ref "$DOCS_REMOTE_PULL_REQUEST_REF" \
               --arg site_sha "$SITE_SHA" \
+              --arg docs_owner "$docs_owner" \
+              --arg docs_repo "$docs_repo" \
+              --arg docs_ref "$DOCS_REF" \
               '{
                 name: $project_name,
                 project: $project_id,
                 customEnvironmentSlugOrId: "connect-preview",
                 gitSource: {
                   type: "github",
-                  org: "ClickHouse",
-                  repo: "mintlify-docs-dev",
-                  ref: "main",
+                  org: $docs_owner,
+                  repo: $docs_repo,
+                  ref: $docs_ref,
                   sha: $site_sha
                 },
                 build: {env: {
@@ -430,15 +434,17 @@ jobs:
           GH_REPO: ${{ github.repository }}
           PREVIEW_URL: ${{ steps.deploy.outputs.preview_url }}
           PULL_REQUEST_NUMBER: ${{ inputs.pull_request_number }}
+          REMOTE_NAME: ${{ inputs.remote_name }}
+          REMOTE_SHA: ${{ steps.request.outputs.head_sha }}
         run: |
           set -euo pipefail
 
-          marker="<!-- nimbus-remote-docs-preview -->"
+          marker="<!-- nimbus-remote-docs-preview:${REMOTE_NAME}:${REMOTE_SHA} -->"
           docs_url="${PREVIEW_URL%/}/docs"
-          body="$(printf '%s\n\nDocumentation preview: %s' "$marker" "$docs_url")"
+          body="$(printf '%s\n\nDocumentation preview for %s: %s' "$marker" "$REMOTE_SHA" "$docs_url")"
           comment_id="$(
             gh api --paginate "repos/$GH_REPO/issues/$PULL_REQUEST_NUMBER/comments" \
-              --jq ".[] | select(.user.login == \"github-actions[bot]\") | select(.body | contains(\"$marker\")) | .id" \
+              --jq ".[] | select(.user.login == \"github-actions[bot]\") | select(.body | startswith(\"$marker\")) | .id" \
               | tail -n 1
           )"
           if [[ -n "$comment_id" ]]; then

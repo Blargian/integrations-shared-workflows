@@ -2,10 +2,8 @@
 # remote documentation source in ClickHouse/mintlify-docs-dev/remotes.json.
 #
 # A maintainer enables previews for a pull request by adding the `docs-preview`
-# label. While the label remains, each new commit refreshes the preview. This
-# uses pull_request_target so organization secrets are available for fork PRs,
-# but neither this caller nor the shared workflow checks out or executes PR
-# code. Vercel Connect fetches the base repository's PR ref inside the build.
+# label. While the label remains, each new commit refreshes the preview. See
+# README.md for the pull_request_target and Vercel Connect security model.
 name: Preview documentation
 
 run-name: Preview documentation for PR #${{ github.event.pull_request.number }}
@@ -19,7 +17,6 @@ on:
       - "docs/**"
 
 permissions:
-  contents: read
   pull-requests: write
 
 jobs:
@@ -30,7 +27,7 @@ jobs:
     uses: ClickHouse/integrations-shared-workflows/.github/workflows/remote-docs-preview.yml@main
     with:
       # This must match the source's name in the central remotes.json registry.
-      remote_name: clickhouse-private
+      remote_name: example-docs
       pull_request_number: ${{ github.event.pull_request.number }}
     secrets:
       VERCEL_TOKEN: ${{ secrets.VERCEL_TOKEN }}

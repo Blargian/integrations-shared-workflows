@@ -14,11 +14,7 @@
 rules:
   dangerous-triggers:
     ignore:
-      # This caller intentionally uses pull_request_target so a maintainer can
-      # authorize a fork preview by adding `docs-preview`. It accepts only the
-      # labeled event, checks the exact label again in the reusable workflow,
-      # and never checks out or executes pull-request content. Vercel Connect
-      # fetches the approved SHA and credentials are removed before MDX runs.
+      # See the remote-docs-preview security model in README.md.
       - caller-remote-docs-preview.yml
   unpinned-uses:
     ignore:
