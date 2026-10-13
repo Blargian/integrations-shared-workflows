@@ -39,7 +39,7 @@ jobs:
     permissions:
       pull-requests: write
     concurrency:
-      group: remote-docs-preview-${{ github.repository }}-${{ inputs.pull_request_number }}
+      group: remote-docs-preview-${{ github.repository }}-${{ inputs.remote_name }}-${{ inputs.pull_request_number }}
       cancel-in-progress: true
     outputs:
       preview_url: ${{ steps.deploy.outputs.preview_url }}
@@ -80,8 +80,14 @@ jobs:
                 exit 1
               fi
               ;;
+            reopened)
+              if [[ "$EVENT_HAS_DOCS_PREVIEW_LABEL" != "true" ]]; then
+                echo "::error::A reopened event requires the docs-preview label."
+                exit 1
+              fi
+              ;;
             *)
-              echo "::error::Remote documentation previews require a docs-preview labeled or synchronize event."
+              echo "::error::Remote documentation previews require a docs-preview labeled, synchronize, or reopened event."
               exit 1
               ;;
           esac
@@ -157,10 +163,15 @@ jobs:
 
           deployment_id=""
           deployment_finished=false
-          # Vercel caps this environment's builds at 40 minutes. Stop polling
-          # at that limit while preserving job time for cancellation and a
-          # useful failure report.
-          poll_deadline=$((SECONDS + 2400))
+          # Reserve five minutes of this 60-minute job for cancellation and a
+          # useful failure report. The 40-minute Vercel build limit starts when
+          # Vercel reports BUILDING, rather than charging queue time against it.
+          job_deadline=$((SECONDS + 3300))
+          build_deadline=0
+
+          curl_request() {
+            curl --connect-timeout 10 --max-time 30 "$@"
+          }
 
           cancel_vercel_deployment() {
             local deployment_id_to_cancel="$1"
@@ -171,7 +182,7 @@ jobs:
             local ready_state
 
             if cancel_response="$(
-              curl --silent --show-error --fail-with-body \
+              curl_request --silent --show-error --fail-with-body \
                 --request PATCH \
                 --header "Authorization: Bearer $VERCEL_TOKEN" \
                 "https://api.vercel.com/v12/deployments/$deployment_id_to_cancel/cancel?teamId=$VERCEL_ORG_ID"
@@ -183,7 +194,7 @@ jobs:
             fi
 
             if deployment_response="$(
-              curl --silent --show-error --fail-with-body \
+              curl_request --silent --show-error --fail-with-body \
                 --header "Authorization: Bearer $VERCEL_TOKEN" \
                 "https://api.vercel.com/v13/deployments/$deployment_id_to_cancel?teamId=$VERCEL_ORG_ID"
             )"; then
@@ -202,7 +213,6 @@ jobs:
           }
 
           cancel_superseded_deployments() {
-            local ready_state
             local until=""
             local list_response
             local next
@@ -211,67 +221,66 @@ jobs:
             local -a request_args
             local -a deployment_ids
 
-            for ready_state in QUEUED INITIALIZING BUILDING; do
-              until=""
-              while true; do
-                request_args=(
-                  --silent
-                  --show-error
-                  --fail-with-body
-                  --get
-                  --header "Authorization: Bearer $VERCEL_TOKEN"
-                  --data-urlencode "projectId=$VERCEL_PROJECT_ID"
-                  --data-urlencode "state=$ready_state"
-                  --data-urlencode "limit=100"
-                  --data-urlencode "teamId=$VERCEL_ORG_ID"
-                )
-                if [[ -n "$until" ]]; then
-                  request_args+=(--data-urlencode "until=$until")
-                fi
+            while true; do
+              request_args=(
+                --silent
+                --show-error
+                --fail-with-body
+                --get
+                --header "Authorization: Bearer $VERCEL_TOKEN"
+                --data-urlencode "projectId=$VERCEL_PROJECT_ID"
+                --data-urlencode "state=QUEUED,INITIALIZING,BUILDING"
+                --data-urlencode "limit=100"
+                --data-urlencode "teamId=$VERCEL_ORG_ID"
+              )
+              if [[ -n "$until" ]]; then
+                request_args+=(--data-urlencode "until=$until")
+              fi
 
-                if ! list_response="$(
-                  curl "${request_args[@]}" "https://api.vercel.com/v7/deployments"
-                )"; then
-                  printf '%s\n' "$list_response" >&2
-                  echo "Unable to list source-preview Vercel deployments." >&2
-                  return 1
-                fi
+              if ! list_response="$(
+                curl_request "${request_args[@]}" "https://api.vercel.com/v7/deployments"
+              )"; then
+                printf '%s\n' "$list_response" >&2
+                echo "Unable to list source-preview Vercel deployments." >&2
+                return 1
+              fi
 
-                if ! deployment_ids_json="$(
-                  jq -ce \
-                    --arg pull_request "$PULL_REQUEST_NUMBER" \
-                    --arg source_repository "$DOCS_REMOTE_REPOSITORY" \
-                    '[.deployments[]
-                      | select((.meta.buildScope? // "") == "source-preview")
-                      | select((.meta.sourceRepository? // "") == $source_repository)
-                      | select((.meta.pullRequest? // "") == $pull_request)
-                      | (.uid // .id)]' \
-                    <<< "$list_response"
-                )"; then
-                  echo "Vercel returned an invalid deployment list." >&2
-                  return 1
-                fi
+              if ! deployment_ids_json="$(
+                jq -ce \
+                  --arg pull_request "$PULL_REQUEST_NUMBER" \
+                  --arg remote_name "$DOCS_REMOTE_NAME" \
+                  --arg source_repository "$DOCS_REMOTE_REPOSITORY" \
+                  '[.deployments[]
+                    | select((.meta.buildScope? // "") == "source-preview")
+                    | select((.meta.sourceRepository? // "") == $source_repository)
+                    | select((.meta.remoteName? // "") == $remote_name)
+                    | select((.meta.pullRequest? // "") == $pull_request)
+                    | (.uid // .id)]' \
+                  <<< "$list_response"
+              )"; then
+                echo "Vercel returned an invalid deployment list." >&2
+                return 1
+              fi
 
-                deployment_ids=()
-                if [[ "$deployment_ids_json" != "[]" ]]; then
-                  mapfile -t deployment_ids < <(jq -r '.[]' <<< "$deployment_ids_json")
+              deployment_ids=()
+              if [[ "$deployment_ids_json" != "[]" ]]; then
+                mapfile -t deployment_ids < <(jq -r '.[]' <<< "$deployment_ids_json")
+              fi
+              for superseded_id in "${deployment_ids[@]}"; do
+                if ! cancel_vercel_deployment "$superseded_id" "superseded source-preview"; then
+                  echo "::warning::Unable to cancel superseded source-preview deployment $superseded_id; continuing with the new preview."
                 fi
-                for superseded_id in "${deployment_ids[@]}"; do
-                  if ! cancel_vercel_deployment "$superseded_id" "superseded source-preview"; then
-                    echo "::warning::Unable to cancel superseded source-preview deployment $superseded_id; continuing with the new preview."
-                  fi
-                done
-
-                next="$(jq -er '.pagination.next // ""' <<< "$list_response")"
-                if [[ -z "$next" ]]; then
-                  break
-                fi
-                if [[ "$next" == "$until" ]]; then
-                  echo "Vercel returned a repeated pagination cursor while listing source-preview deployments." >&2
-                  return 1
-                fi
-                until="$next"
               done
+
+              next="$(jq -er '.pagination.next // ""' <<< "$list_response")"
+              if [[ -z "$next" ]]; then
+                break
+              fi
+              if [[ "$next" == "$until" ]]; then
+                echo "Vercel returned a repeated pagination cursor while listing source-preview deployments." >&2
+                return 1
+              fi
+              until="$next"
             done
           }
 
@@ -292,14 +301,16 @@ jobs:
             exit "$exit_code"
           }
 
-          cancel_superseded_deployments
+          if ! cancel_superseded_deployments; then
+            echo "::warning::Unable to cancel superseded source-preview deployments; continuing with the new preview."
+          fi
 
           trap finalize_deployment EXIT
           trap 'exit 130' INT
           trap 'exit 143' TERM
 
           if ! project_response="$(
-            curl --silent --show-error --fail-with-body \
+            curl_request --silent --show-error --fail-with-body \
               --header "Authorization: Bearer $VERCEL_TOKEN" \
               "https://api.vercel.com/v9/projects/$VERCEL_PROJECT_ID?teamId=$VERCEL_ORG_ID"
           )"; then
@@ -354,6 +365,7 @@ jobs:
                   buildScope: "source-preview",
                   sourceRepository: $remote_repository,
                   sourceHeadRepository: $source_repository,
+                  remoteName: $remote_name,
                   pullRequest: $pull_request,
                   approvedSha: $approved_sha,
                   siteSha: $site_sha
@@ -362,7 +374,7 @@ jobs:
           )"
 
           if ! deployment_response="$(
-            curl --silent --show-error --fail-with-body \
+            curl_request --silent --show-error --fail-with-body \
               --request POST \
               --header "Authorization: Bearer $VERCEL_TOKEN" \
               --header "Content-Type: application/json" \
@@ -380,12 +392,12 @@ jobs:
             echo "Vercel returned an invalid preview URL." >&2
             exit 1
           fi
-          echo "preview_url=$preview_url" >> "$GITHUB_OUTPUT"
           echo "Vercel deployment: $preview_url"
 
-          while (( SECONDS < poll_deadline )); do
+          ready_state=""
+          while (( SECONDS < job_deadline && (build_deadline == 0 || SECONDS < build_deadline) )); do
             if ! deployment_response="$(
-              curl --silent --show-error --fail-with-body \
+              curl_request --silent --show-error --fail-with-body \
                 --header "Authorization: Bearer $VERCEL_TOKEN" \
                 "https://api.vercel.com/v13/deployments/$deployment_id?teamId=$VERCEL_ORG_ID"
             )"; then
@@ -399,12 +411,32 @@ jobs:
                 break
                 ;;
               ERROR|CANCELED|DELETED|BLOCKED)
+                deployment_finished=true
                 jq -r '(.errorCode // "deployment_failed") + ": " + (.errorMessage // "Vercel deployment did not complete")' \
                   <<< "$deployment_response" >&2
                 exit 1
                 ;;
+              QUEUED|INITIALIZING)
+                wake_deadline=$job_deadline
+                ;;
+              BUILDING)
+                if (( build_deadline == 0 )); then
+                  build_deadline=$((SECONDS + 2400))
+                fi
+                wake_deadline=$build_deadline
+                if (( job_deadline < wake_deadline )); then
+                  wake_deadline=$job_deadline
+                fi
+                ;;
+              *)
+                echo "Unexpected Vercel deployment state: $ready_state" >&2
+                exit 1
+                ;;
+            esac
+
+            case "$ready_state" in
               QUEUED|INITIALIZING|BUILDING)
-                remaining_seconds=$((poll_deadline - SECONDS))
+                remaining_seconds=$((wake_deadline - SECONDS))
                 if (( remaining_seconds <= 0 )); then
                   break
                 fi
@@ -415,10 +447,6 @@ jobs:
                 sleep "$sleep_seconds" &
                 wait "$!"
                 ;;
-              *)
-                echo "Unexpected Vercel deployment state: $ready_state" >&2
-                exit 1
-                ;;
             esac
           done
 
@@ -427,6 +455,7 @@ jobs:
             exit 1
           fi
           deployment_finished=true
+          echo "preview_url=$preview_url" >> "$GITHUB_OUTPUT"
 
       - name: Add the preview link to the pull request
         env:
@@ -439,12 +468,13 @@ jobs:
         run: |
           set -euo pipefail
 
-          marker="<!-- nimbus-remote-docs-preview:${REMOTE_NAME}:${REMOTE_SHA} -->"
+          marker="<!-- nimbus-remote-docs-preview:${REMOTE_NAME} -->"
           docs_url="${PREVIEW_URL%/}/docs"
           body="$(printf '%s\n\nDocumentation preview for %s: %s' "$marker" "$REMOTE_SHA" "$docs_url")"
           comment_id="$(
             gh api --paginate "repos/$GH_REPO/issues/$PULL_REQUEST_NUMBER/comments" \
-              --jq ".[] | select(.user.login == \"github-actions[bot]\") | select(.body | startswith(\"$marker\")) | .id" \
+              | jq -r --arg marker "$marker" \
+                '.[] | select(.user.login == "github-actions[bot]") | select(.body | startswith($marker)) | .id' \
               | tail -n 1
           )"
           if [[ -n "$comment_id" ]]; then

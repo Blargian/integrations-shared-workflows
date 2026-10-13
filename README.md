@@ -41,11 +41,11 @@ See [`examples/caller-remote-docs-preview.yml`](examples/caller-remote-docs-prev
 for a copy-paste `pull_request_target` caller. Set `remote_name` to the source's
 registered name and configure the caller's native `paths` filter for the files
 that should be eligible, such as `docs/**`. Remove `paths` when every pull
-request should be eligible. GitHub starts the reusable workflow when the pull
-request changes a configured path, a maintainer adds `docs-preview`, or the
-labelled pull request receives a new commit. The caller listens only for
-`labeled` and `synchronize` events; the shared workflow independently verifies
-the label, action, pull request number, event SHA, and default target branch.
+request should be eligible. The configured `paths` filter applies to every
+eligible event. The caller listens for `labeled`, `synchronize`, and `reopened`;
+the job runs only when the PR matches that filter and either adds `docs-preview`
+or already has it. The shared workflow independently verifies the label, action,
+pull request number, event SHA, and default target branch.
 
 ### `claude-docs-drift.yml` - Dispatch centralized docs drift checks
 
